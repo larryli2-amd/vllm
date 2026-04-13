@@ -78,6 +78,8 @@ class AiterMLADecodeMetadata(MLACommonDecodeMetadata):
     attn_out_dtype: torch.dtype = torch.bfloat16
     # The max query output length: int
     max_qo_len: int | None = None
+    # Whether persistent MLA metadata was computed (only for qseqlen=1)
+    has_persistent_metadata: bool = False
 
 
 @dataclass
@@ -274,7 +276,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         # We track whether persistent metadata was successfully computed
         # so forward_mqa can skip passing it (falling back to the kernel
         # computing its own metadata internally, like v0.18.0).
-        self._has_persistent_metadata = False
+        has_persistent_metadata = False
         if max_qo_len == 1:
             from aiter import get_mla_metadata_v1
 
@@ -297,7 +299,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                 uni_seqlen_qo=max_qo_len,
                 fast_mode=True,
             )
-            self._has_persistent_metadata = True
+            has_persistent_metadata = True
 
         attn_metadata = AiterMLADecodeMetadata(
             block_table=block_table_tensor,
@@ -309,6 +311,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             dcp_tot_seq_lens=dcp_tot_seq_lens_device,
             max_qo_len=max_qo_len,
             attn_out_dtype=self.decode_attn_out_dtype,
+            has_persistent_metadata=has_persistent_metadata,
         )
 
         return attn_metadata
@@ -322,7 +325,8 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         attn_metadata = super().build(
             common_prefix_len, common_attn_metadata, fast_build
         )
-        if self._has_persistent_metadata:
+        if (attn_metadata.decode is not None
+                and attn_metadata.decode.has_persistent_metadata):
             attn_metadata.work_meta_data = self._mla_work_meta_data
             attn_metadata.work_indptr = self._mla_work_indptr
             attn_metadata.work_info_set = self._mla_work_info_set
