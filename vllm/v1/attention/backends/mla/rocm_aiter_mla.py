@@ -326,7 +326,8 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             common_prefix_len, common_attn_metadata, fast_build
         )
         if (attn_metadata.decode is not None
-                and attn_metadata.decode.has_persistent_metadata):
+            and attn_metadata.decode.has_persistent_metadata
+        ):
             attn_metadata.work_meta_data = self._mla_work_meta_data
             attn_metadata.work_indptr = self._mla_work_indptr
             attn_metadata.work_info_set = self._mla_work_info_set
