@@ -88,6 +88,14 @@ method keeps the draft model in `model`, and its `SpeculativeMethodSpec` tells
 vLLM what the drafter needs (target hidden states, auxiliary hidden states and
 lookahead KV slots).
 
+When a registered method reads target hidden states and prefix caching is
+enabled, it must also set
+`prefix_cache_lookahead_tokens=lambda config: ...` on its
+`SpeculativeMethodSpec`. The callable returns the number of prefill tokens past
+each cached prefix that the draft KV reads. A positive value requires the
+plugin's draft KV cache specs to be annotated with `is_draft=True`; vLLM rejects
+the configuration during KV-cache planning when that annotation is missing.
+
 A method that verifies drafts other than a chain (a tree, for example) on a
 hybrid model with gated delta net or Mamba2 layers can also replace the
 spec-decode conv and recurrence of those layers. It names a factory in

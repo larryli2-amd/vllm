@@ -68,6 +68,11 @@ class SpeculativeMethodSpec:
     method verify non-chain drafts on gated delta net and Mamba2 layers of
     hybrid models."""
 
+    prefix_cache_lookahead_tokens: Callable[["SpeculativeConfig"], int] | None = None
+    """Prefill tokens past a cached prefix that the draft KV reads. A
+    target-hidden-state method must set this when prefix caching is enabled.
+    A positive value requires its draft KV cache specs to set ``is_draft=True``."""
+
     def resolve_speculator_cls(self) -> type:
         return resolve_obj_by_qualname(self.speculator_cls.replace(":", "."))
 

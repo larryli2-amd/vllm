@@ -1633,7 +1633,8 @@ def get_global_kv_cache_groups(
 
     # When speculating with more than 1 speculative module (e.g. multi-layered MTP)
     # tag every SlidingWindowSpec with how many extra tokens to retain in the window.
-    extra_retained_tokens = max(0, vllm_config.num_prefill_lookahead_tokens - 1)
+    num_prefill_lookahead = vllm_config.num_prefill_lookahead_tokens
+    extra_retained_tokens = max(0, num_prefill_lookahead - 1)
     for layer_name, layer_spec in merged_kv_cache_specs.items():
         if isinstance(layer_spec, SlidingWindowSpec):
             merged_kv_cache_specs[layer_name] = replace(
@@ -1647,10 +1648,23 @@ def get_global_kv_cache_groups(
         builder, vllm_config, merged_kv_cache_specs
     )
     spec_config = vllm_config.speculative_config
-    if spec_config is not None and spec_config.use_eagle_block_drop():
+    if spec_config is not None:
         draft_layer_names = {
             name for name, spec in merged_kv_cache_specs.items() if spec.is_draft
         }
+        registered = spec_config.registered_method()
+        if (
+            registered is not None
+            and registered.prefix_cache_lookahead_tokens is not None
+            and num_prefill_lookahead > 0
+            and not draft_layer_names
+        ):
+            raise ValueError(
+                f"Registered speculative method '{spec_config.method}' declares a "
+                "positive `prefix_cache_lookahead_tokens`, but no draft KV cache "
+                "spec is annotated `is_draft=True`."
+            )
+    if spec_config is not None and spec_config.use_eagle_block_drop():
         for group in global_kv_cache_groups:
             group.is_eagle_group = not draft_layer_names.isdisjoint(group.layer_names)
         _warn_if_unannotated_eagle_mamba(spec_config, global_kv_cache_groups)
