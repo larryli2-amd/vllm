@@ -36,6 +36,16 @@ from vllm.v1.attention.ops.paged_attn import PagedAttention
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
 )
+from vllm.v1.attention.verify_extension import (
+    FullAttentionVerifyBackend,
+    FullAttentionVerifyExtension,
+    FullAttentionVerifyKVCache,
+    FullAttentionVerifyMetadata,
+    FullAttentionVerifyRows,
+    build_full_attention_verify_metadata,
+    dispatch_full_attention_verify,
+    should_dispatch_full_attention_verify,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheLayout,
@@ -43,6 +53,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+_ROCM_ATTN_PAGED_KV_LAYOUT = "ROCM_ATTN_PAGED_KV_V1"
 
 
 @dataclass
@@ -69,6 +80,9 @@ class RocmAttentionMetadata:
     # DFlash drafting sets this to False via CommonAttentionMetadata.
     causal: bool = True
 
+    full_attn_verify_extension: FullAttentionVerifyExtension | None = None
+    full_attn_verify_metadata: FullAttentionVerifyMetadata | None = None
+
 
 class RocmAttentionMetadataBuilder(AttentionMetadataBuilder[RocmAttentionMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
@@ -90,10 +104,47 @@ class RocmAttentionMetadataBuilder(AttentionMetadataBuilder[RocmAttentionMetadat
         )
         self.num_heads_kv = model_config.get_num_kv_heads(vllm_config.parallel_config)
         self.headdim = model_config.get_head_size()
+        self.full_attn_verify_extension: FullAttentionVerifyExtension | None = None
+        self.full_attn_verify_backend: FullAttentionVerifyBackend | None = None
+
+    def set_full_attention_verify_extension(
+        self,
+        extension: FullAttentionVerifyExtension,
+        backend: FullAttentionVerifyBackend,
+    ) -> None:
+        expected_backend = FullAttentionVerifyBackend.from_backend(RocmAttentionBackend)
+        if backend != expected_backend:
+            raise ValueError(
+                "ROCM_ATTN can only attach an extension for its exact backend identity."
+            )
+        if getattr(self.kv_cache_spec, "is_draft", False):
+            raise ValueError("ROCM_ATTN full-attention verify dispatch is target-only.")
+        if getattr(self.kv_cache_spec, "non_causal", False):
+            raise ValueError(
+                "ROCM_ATTN full-attention verify dispatch does not support "
+                "non-causal KV cache specs."
+            )
+        if self.vllm_config.parallel_config.decode_context_parallel_size > 1:
+            raise ValueError(
+                "ROCM_ATTN full-attention verify dispatch does not support "
+                "decode context parallelism."
+            )
+        if is_quantized_kv_cache(self.vllm_config.cache_config.cache_dtype):
+            raise ValueError(
+                "ROCM_ATTN full-attention verify dispatch does not support "
+                "quantized KV cache."
+            )
+        self.full_attn_verify_extension = extension
+        self.full_attn_verify_backend = backend
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> RocmAttentionMetadata:
+        if self.full_attn_verify_extension is not None:
+            raise RuntimeError(
+                "ROCM_ATTN full-attention verify dispatch does not support "
+                "CUDA graph capture."
+            )
         attn_metadata = self.build(0, common_attn_metadata)
         # When doing full graph capture, setting seq_lens to
         # max_model_len will cause graph capture to be extremely
@@ -120,6 +171,12 @@ class RocmAttentionMetadataBuilder(AttentionMetadataBuilder[RocmAttentionMetadat
         seq_lens = common_attn_metadata.seq_lens
         block_table_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
+        full_attn_verify_metadata = None
+        if self.full_attn_verify_extension is not None:
+            assert self.full_attn_verify_backend is not None
+            full_attn_verify_metadata = build_full_attention_verify_metadata(
+                self.full_attn_verify_backend, common_attn_metadata
+            )
 
         attn_metadata = RocmAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -130,6 +187,8 @@ class RocmAttentionMetadataBuilder(AttentionMetadataBuilder[RocmAttentionMetadat
             block_table=block_table_tensor,
             slot_mapping=slot_mapping,
             causal=common_attn_metadata.causal,
+            full_attn_verify_extension=self.full_attn_verify_extension,
+            full_attn_verify_metadata=full_attn_verify_metadata,
         )
         return attn_metadata
 
@@ -192,6 +251,10 @@ class RocmAttentionBackend(AttentionBackend):
         # ROCM_ATTN uses (2, num_blocks, ...) KV cache layout which is
         # incompatible with KV connectors that require blocks-first layout.
         return False
+
+    @classmethod
+    def supports_full_attention_verify_extension(cls) -> bool:
+        return True
 
     forward_includes_kv_cache_update: bool = False
 
@@ -355,6 +418,163 @@ class RocmAttentionImpl(AttentionImpl):
         )
         return output
 
+    def _split_kv_cache(
+        self, kv_cache: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the exact K/V views used by the ROCM_ATTN forward path."""
+        return PagedAttention.split_kv_cache(
+            kv_cache.transpose(0, 1), self.num_kv_heads, self.head_size
+        )
+
+    def _full_attention_verify_kv_cache(
+        self, kv_cache: torch.Tensor
+    ) -> FullAttentionVerifyKVCache:
+        """Adapt ROCM_ATTN's native cache views for a verify extension."""
+        key_cache, value_cache = self._split_kv_cache(kv_cache)
+        return FullAttentionVerifyKVCache(
+            layout=_ROCM_ATTN_PAGED_KV_LAYOUT,
+            native=kv_cache,
+            key=key_cache,
+            value=value_cache,
+        )
+
+    def _validate_full_attention_verify_dispatch(
+        self,
+        key: torch.Tensor | None,
+        value: torch.Tensor | None,
+        attn_metadata: RocmAttentionMetadata,
+        verify_metadata: FullAttentionVerifyMetadata,
+        output_scale: torch.Tensor | None,
+        output_block_scale: torch.Tensor | None,
+    ) -> None:
+        if self.attn_type != AttentionType.DECODER:
+            raise NotImplementedError(
+                "ROCM_ATTN full-attention verify dispatch only supports decoder "
+                "attention."
+            )
+        if key is None or value is None:
+            raise NotImplementedError(
+                "ROCM_ATTN full-attention verify dispatch does not support "
+                "shared or missing K/V."
+            )
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            raise NotImplementedError(
+                "ROCM_ATTN full-attention verify dispatch does not support "
+                "quantized KV cache."
+            )
+        if self.sliding_window != (-1, -1):
+            raise NotImplementedError(
+                "ROCM_ATTN full-attention verify dispatch does not support "
+                "sliding-window attention."
+            )
+        if self.alibi_slopes is not None or self.sinks is not None:
+            raise NotImplementedError(
+                "ROCM_ATTN full-attention verify dispatch does not support "
+                "ALiBi slopes or attention sinks."
+            )
+        if self.logits_soft_cap != 0:
+            raise NotImplementedError(
+                "ROCM_ATTN full-attention verify dispatch does not support "
+                "logits soft cap."
+            )
+        if self._use_interleaved_v_cache:
+            raise NotImplementedError(
+                "ROCM_ATTN full-attention verify dispatch does not support "
+                "interleaved V cache."
+            )
+        if output_scale is not None or output_block_scale is not None:
+            raise NotImplementedError(
+                "ROCM_ATTN full-attention verify dispatch does not support "
+                "fused output quantization."
+            )
+        if self.dcp_world_size != 1:
+            raise NotImplementedError(
+                "ROCM_ATTN full-attention verify dispatch does not support "
+                "decode context parallelism."
+            )
+        if attn_metadata.causal is not True:
+            raise NotImplementedError(
+                "ROCM_ATTN full-attention verify dispatch only supports "
+                "causal metadata."
+            )
+        is_prefilling = verify_metadata.is_prefilling
+        if is_prefilling is None or is_prefilling.device.type != "cpu":
+            raise NotImplementedError(
+                "ROCM_ATTN full-attention verify dispatch requires CPU "
+                "is_prefilling metadata."
+            )
+        if bool(is_prefilling.any()):
+            raise NotImplementedError(
+                "ROCM_ATTN full-attention verify dispatch does not support "
+                "prefill or mixed prefill/verify batches."
+            )
+
+    def _maybe_dispatch_full_attention_verify(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        value: torch.Tensor | None,
+        kv_cache: torch.Tensor,
+        attn_metadata: RocmAttentionMetadata,
+        output: torch.Tensor,
+        output_scale: torch.Tensor | None,
+        output_block_scale: torch.Tensor | None,
+    ) -> bool:
+        extension = attn_metadata.full_attn_verify_extension
+        verify_metadata = attn_metadata.full_attn_verify_metadata
+        if extension is None and verify_metadata is None:
+            return False
+        if extension is None or verify_metadata is None:
+            raise RuntimeError(
+                "ROCM_ATTN full-attention verify metadata and extension must "
+                "either both be set or both be absent."
+            )
+        if not should_dispatch_full_attention_verify(extension, verify_metadata):
+            return False
+
+        self._validate_full_attention_verify_dispatch(
+            key,
+            value,
+            attn_metadata,
+            verify_metadata,
+            output_scale,
+            output_block_scale,
+        )
+        assert key is not None and value is not None
+        layer_name = getattr(layer, "layer_name", None)
+        if not isinstance(layer_name, str):
+            raise RuntimeError(
+                "ROCM_ATTN full-attention verify dispatch requires an attention "
+                "layer name."
+            )
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        rows = FullAttentionVerifyRows(
+            layer_name=layer_name,
+            query=query[:num_actual_tokens],
+            key=key[:num_actual_tokens],
+            value=value[:num_actual_tokens],
+            kv_cache=self._full_attention_verify_kv_cache(kv_cache),
+            output=output[:num_actual_tokens],
+            metadata=verify_metadata,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_size,
+            head_size_v=self.head_size,
+            scale=self.scale,
+            kv_cache_dtype=self.kv_cache_dtype,
+            attn_type=self.attn_type,
+            sliding_window=None,
+            logits_soft_cap=None,
+            alibi_slopes=None,
+            sinks=None,
+            q_scale=layer._q_scale,
+            k_scale=layer._k_scale,
+            v_scale=layer._v_scale,
+        )
+        dispatch_full_attention_verify(extension, rows)
+        return True
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -396,6 +616,19 @@ class RocmAttentionImpl(AttentionImpl):
             # Profiling run.
             return output.fill_(0)
 
+        if self._maybe_dispatch_full_attention_verify(
+            layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output,
+            output_scale,
+            output_block_scale,
+        ):
+            return output
+
         # IMPORTANT!
         # NOTE(woosuk): With piece-wise CUDA graphs, this method is executed in
         # eager-mode PyTorch. Thus, we need to be careful about any CPU overhead
@@ -419,9 +652,7 @@ class RocmAttentionImpl(AttentionImpl):
 
         # The bound view is logical [B, 2, N, H*hs]; split_kv_cache expects
         # the K/V groups first.
-        key_cache, value_cache = PagedAttention.split_kv_cache(
-            kv_cache.transpose(0, 1), self.num_kv_heads, self.head_size
-        )
+        key_cache, value_cache = self._split_kv_cache(kv_cache)
 
         if is_quantized_kv_cache(self.kv_cache_dtype):
             key_cache = key_cache.view(self.fp8_dtype)
