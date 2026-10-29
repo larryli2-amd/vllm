@@ -108,16 +108,23 @@ A registered method can similarly name a
 row views, and requires both the extension and attention backend to declare
 support for each other. A capable backend must attach the extension in its
 metadata builder and explicitly call `dispatch_full_attention_verify`; dispatch
-has no causal fallback.
+has no causal fallback once the extension explicitly selects the rows.
 
-This is currently an ABI for out-of-tree attention backends, not an in-tree
-tree-attention implementation. `FlashAttentionBackend` and
-`RocmAttentionBackend` do not yet wire the metadata and forward paths, so a
-factory that returns an extension with either backend is rejected during
-metadata-builder setup. Backend wiring, feature validation (including mixed
-prefill/verify batches, sliding windows, quantized KV cache and context
-parallelism), and any tree-attention kernel remain pending and must not be
-implemented by silently falling back to chain attention.
+`RocmAttentionBackend` (`ROCM_ATTN`) wires an eager-only dispatch seam. Its
+extension must return `True` from `should_dispatch(metadata)` only for
+explicitly staged, pure tree-verify rows; ordinary prefill and decode rows must
+return `False`. Selected rows receive the backend's native
+`ROCM_ATTN_PAGED_KV_V1` adapter, including the exact K/V views used by the
+normal forward path. This is host dispatch only: it does not provide tree
+policy, metadata staging, KV relocation after acceptance, or a tree kernel.
+
+The ROCM seam rejects CUDA graphs, decode context parallelism, quantized or
+interleaved KV cache, sliding windows, ALiBi, sinks, logits soft caps, fused
+output quantization, non-causal metadata, shared K/V, and non-decoder
+attention, and prefill or mixed prefill/verify batches. `FlashAttentionBackend`
+and `ROCM_AITER_FA` remain unsupported until their metadata and forward
+contracts are explicitly implemented; they must not silently fall back to
+chain attention.
 
 A speculator can also stop drafting when speculation no longer pays (for
 example, at large batch sizes). It sets `may_suspend_drafting = True` and

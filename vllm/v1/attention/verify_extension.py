@@ -4,8 +4,7 @@
 
 The contract is intentionally separate from any attention kernel. An
 out-of-tree backend must explicitly opt in, attach the extension to its
-metadata, and call :func:`dispatch_full_attention_verify`. The in-tree
-FlashAttention and ROCmAttention backends do not do that yet.
+metadata, and call :func:`dispatch_full_attention_verify`.
 """
 
 from dataclasses import dataclass
@@ -66,6 +65,21 @@ class FullAttentionVerifyMetadata:
 
 
 @dataclass(frozen=True)
+class FullAttentionVerifyKVCache:
+    """Native KV-cache views exported by the wired attention backend.
+
+    The views preserve the backend's storage and strides. They are only valid
+    for the exact backend identity and ``layout`` declared in the metadata;
+    they are not a portable KV-cache representation.
+    """
+
+    layout: str
+    native: torch.Tensor
+    key: torch.Tensor
+    value: torch.Tensor
+
+
+@dataclass(frozen=True)
 class FullAttentionVerifyRows:
     """Data-only view of one full-attention layer's verify forward.
 
@@ -73,8 +87,9 @@ class FullAttentionVerifyRows:
     "not handled" result: a capable backend calls this only for a non-chain
     verify and must use its normal path for all other forwards.
 
-    ``kv_cache`` keeps the identified backend's native layout and strides.
-    This ABI does not pretend FlashAttention and ROCmAttention caches are
+    ``kv_cache`` keeps the identified backend's native layout and strides,
+    including the key and value views its forward path normally uses. This ABI
+    does not pretend FlashAttention and ROCmAttention caches are
     interchangeable; each backend wiring must document and test its layout.
     """
 
@@ -82,7 +97,7 @@ class FullAttentionVerifyRows:
     query: torch.Tensor
     key: torch.Tensor | None
     value: torch.Tensor | None
-    kv_cache: torch.Tensor
+    kv_cache: FullAttentionVerifyKVCache
     output: torch.Tensor
     metadata: FullAttentionVerifyMetadata
     num_heads: int
@@ -113,6 +128,15 @@ class FullAttentionVerifyExtension:
     """
 
     def supports_backend(self, backend: FullAttentionVerifyBackend) -> bool:
+        return False
+
+    def should_dispatch(self, metadata: FullAttentionVerifyMetadata) -> bool:
+        """Whether ``metadata`` describes explicitly staged verify rows.
+
+        Return ``False`` for ordinary prefill and decode forwards. A wired
+        backend has no generic tree policy, so it dispatches only after the
+        extension returns the literal Python value ``True``.
+        """
         return False
 
     def forward(self, rows: FullAttentionVerifyRows) -> None:
@@ -176,6 +200,19 @@ def create_full_attn_verify_extension(
             f"{capability.name} ({capability.class_path})."
         )
     return extension
+
+
+def should_dispatch_full_attention_verify(
+    extension: FullAttentionVerifyExtension,
+    metadata: FullAttentionVerifyMetadata,
+) -> bool:
+    """Return the extension's explicit host-side dispatch decision."""
+    should_dispatch = extension.should_dispatch(metadata)
+    if type(should_dispatch) is not bool:
+        raise TypeError(
+            "FullAttentionVerifyExtension.should_dispatch must return a Python bool."
+        )
+    return should_dispatch
 
 
 def dispatch_full_attention_verify(

@@ -12,7 +12,8 @@ from tests.v1.attention.utils import (
     create_common_attn_metadata,
     create_vllm_config,
 )
-from vllm.config import SpeculativeConfig
+from vllm.config import SpeculativeConfig, set_current_vllm_config
+from vllm.model_executor.layers.attention.attention import Attention
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
@@ -20,13 +21,20 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.backends.rocm_attn import (
+    RocmAttentionBackend,
+    RocmAttentionImpl,
+)
+from vllm.v1.attention.ops.paged_attn import PagedAttention
 from vllm.v1.attention.verify_extension import (
     FullAttentionVerifyBackend,
     FullAttentionVerifyExtension,
+    FullAttentionVerifyKVCache,
     FullAttentionVerifyMetadata,
     FullAttentionVerifyRows,
     build_full_attention_verify_metadata,
     dispatch_full_attention_verify,
+    should_dispatch_full_attention_verify,
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.spec_decode import registry
@@ -42,8 +50,10 @@ NAME = "unit_test_full_attention_method"
 FACTORY = f"{__name__}:make_extension"
 INVALID_FACTORY = f"{__name__}:make_invalid_extension"
 NONE_FACTORY = f"{__name__}:make_no_extension"
+ROCM_FACTORY = f"{__name__}:make_rocm_extension"
 SPECULATOR = f"{__name__}:DummySpeculator"
 created: list["RecordingExtension"] = []
+rocm_created: list["RocmRecordingExtension"] = []
 
 
 class DummySpeculator:
@@ -67,6 +77,22 @@ class RecordingExtension(FullAttentionVerifyExtension):
         rows.output.fill_(7)
 
 
+class RocmRecordingExtension(FullAttentionVerifyExtension):
+    def __init__(self, vllm_config):
+        self.vllm_config = vllm_config
+        self.rows: list[FullAttentionVerifyRows] = []
+
+    def supports_backend(self, backend: FullAttentionVerifyBackend) -> bool:
+        return backend == FullAttentionVerifyBackend.from_backend(RocmAttentionBackend)
+
+    def should_dispatch(self, metadata: FullAttentionVerifyMetadata) -> bool:
+        return True
+
+    def forward(self, rows: FullAttentionVerifyRows) -> None:
+        self.rows.append(rows)
+        rows.output.fill_(11)
+
+
 def make_extension(vllm_config):
     extension = RecordingExtension(vllm_config)
     created.append(extension)
@@ -79,6 +105,12 @@ def make_invalid_extension(vllm_config):
 
 def make_no_extension(vllm_config):
     return None
+
+
+def make_rocm_extension(vllm_config):
+    extension = RocmRecordingExtension(vllm_config)
+    rocm_created.append(extension)
+    return extension
 
 
 @dataclass(frozen=True)
@@ -154,6 +186,7 @@ class UnsupportedCapableBackend(FakeFullAttentionBackend):
 @pytest.fixture(autouse=True)
 def clear_created():
     created.clear()
+    rocm_created.clear()
 
 
 @pytest.fixture
@@ -207,12 +240,19 @@ def _rows(
     metadata: FullAttentionVerifyMetadata, output: torch.Tensor
 ) -> FullAttentionVerifyRows:
     num_tokens = output.shape[0]
+    native_kv_cache = torch.zeros(2, 1, BLOCK_SIZE, 16)
+    key_cache, value_cache = native_kv_cache.unbind(0)
     return FullAttentionVerifyRows(
         layer_name="model.layers.0.self_attn.attn",
         query=torch.zeros_like(output),
         key=torch.zeros(num_tokens, 1, 8),
         value=torch.zeros(num_tokens, 1, 8),
-        kv_cache=torch.zeros(2, 1, BLOCK_SIZE, 16),
+        kv_cache=FullAttentionVerifyKVCache(
+            layout="FAKE_KV_LAYOUT",
+            native=native_kv_cache,
+            key=key_cache,
+            value=value_cache,
+        ),
         output=output,
         metadata=metadata,
         num_heads=2,
@@ -274,6 +314,9 @@ def test_factory_builder_metadata_and_dispatch_contract(registered):
     assert metadata.verify.seq_lens is common.seq_lens
     assert metadata.verify.block_table is common.block_table_tensor
     assert metadata.verify.slot_mapping is common.slot_mapping
+    assert not should_dispatch_full_attention_verify(
+        metadata.verify_extension, metadata.verify
+    )
 
     output = torch.zeros(4, 2, 8)
     rows = _rows(metadata.verify, output)
@@ -352,3 +395,139 @@ def test_draft_attention_group_does_not_get_target_verify_extension(registered):
     assert isinstance(builder, RecordingMetadataBuilder)
     assert builder.verify_extension is None
     assert created == []
+
+
+def _rocm_group() -> AttentionGroup:
+    return AttentionGroup(
+        backend=RocmAttentionBackend,
+        layer_names=["unit.test.attn"],
+        kv_cache_spec=_kv_cache_spec(),
+        kv_cache_group_id=0,
+    )
+
+
+def _rocm_attention(
+    vllm_config, *, per_layer_sliding_window: int | None = None
+) -> Attention:
+    with set_current_vllm_config(vllm_config):
+        attention = Attention(
+            num_heads=2,
+            head_size=8,
+            scale=8**-0.5,
+            num_kv_heads=1,
+            cache_config=vllm_config.cache_config,
+            per_layer_sliding_window=per_layer_sliding_window,
+            prefix="unit.test.attn",
+            attn_backend=RocmAttentionBackend,
+        )
+    assert isinstance(attention.impl, RocmAttentionImpl)
+    return attention
+
+
+def _rocm_verify_metadata(registered, *, is_prefilling: torch.Tensor | None = None):
+    registered(ROCM_FACTORY)
+    vllm_config = _vllm_config(NAME)
+    group = _rocm_group()
+    group.create_metadata_builders(vllm_config, DEVICE)
+    if is_prefilling is None:
+        is_prefilling = torch.zeros(1, dtype=torch.bool)
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[20], query_lens=[2]), BLOCK_SIZE, DEVICE
+    ).replace(is_prefilling=is_prefilling)
+    metadata = group.build_metadata(common)
+    assert len(rocm_created) == 1
+    return vllm_config, group, common, metadata, rocm_created[0]
+
+
+def test_rocm_attn_dispatches_selected_verify_rows_with_native_kv_views(registered):
+    vllm_config, _, _, metadata, extension = _rocm_verify_metadata(registered)
+    assert metadata.full_attn_verify_extension is extension
+    assert metadata.full_attn_verify_metadata is not None
+
+    attention = _rocm_attention(vllm_config)
+    query = torch.zeros(2, 2, 8)
+    key = torch.zeros(2, 1, 8)
+    value = torch.zeros(2, 1, 8)
+    kv_cache = torch.zeros(1, 2, BLOCK_SIZE, 8)
+    output = torch.zeros_like(query)
+
+    result = attention.impl.forward(
+        attention,
+        query,
+        key,
+        value,
+        kv_cache,
+        metadata,
+        output,
+    )
+
+    assert result is output
+    assert torch.equal(output, torch.full_like(output, 11))
+    assert len(extension.rows) == 1
+    rows = extension.rows[0]
+    assert rows.layer_name == attention.layer_name
+    assert rows.metadata is metadata.full_attn_verify_metadata
+    assert rows.kv_cache.layout == "ROCM_ATTN_PAGED_KV_V1"
+    assert rows.kv_cache.native is kv_cache
+    expected_key, expected_value = PagedAttention.split_kv_cache(
+        kv_cache.transpose(0, 1), 1, 8
+    )
+    assert rows.kv_cache.key.data_ptr() == expected_key.data_ptr()
+    assert rows.kv_cache.key.stride() == expected_key.stride()
+    assert rows.kv_cache.value.data_ptr() == expected_value.data_ptr()
+    assert rows.kv_cache.value.stride() == expected_value.stride()
+
+
+def test_rocm_attn_verify_dispatch_refuses_sliding_window(registered):
+    vllm_config, _, _, metadata, extension = _rocm_verify_metadata(registered)
+    attention = _rocm_attention(vllm_config, per_layer_sliding_window=4)
+    query = torch.zeros(2, 2, 8)
+    key = torch.zeros(2, 1, 8)
+    value = torch.zeros(2, 1, 8)
+    kv_cache = torch.zeros(1, 2, BLOCK_SIZE, 8)
+    output = torch.zeros_like(query)
+
+    with pytest.raises(NotImplementedError, match="sliding-window"):
+        attention.impl.forward(
+            attention,
+            query,
+            key,
+            value,
+            kv_cache,
+            metadata,
+            output,
+        )
+
+    assert extension.rows == []
+
+
+def test_rocm_attn_verify_dispatch_refuses_prefill_or_mixed_batches(registered):
+    vllm_config, _, _, metadata, extension = _rocm_verify_metadata(
+        registered, is_prefilling=torch.tensor([True])
+    )
+    attention = _rocm_attention(vllm_config)
+    query = torch.zeros(2, 2, 8)
+    key = torch.zeros(2, 1, 8)
+    value = torch.zeros(2, 1, 8)
+    kv_cache = torch.zeros(1, 2, BLOCK_SIZE, 8)
+    output = torch.zeros_like(query)
+
+    with pytest.raises(NotImplementedError, match="prefill or mixed"):
+        attention.impl.forward(
+            attention,
+            query,
+            key,
+            value,
+            kv_cache,
+            metadata,
+            output,
+        )
+
+    assert extension.rows == []
+
+
+def test_rocm_attn_verify_dispatch_refuses_cudagraph_capture(registered):
+    _, group, common, _, _ = _rocm_verify_metadata(registered)
+
+    with pytest.raises(RuntimeError, match="CUDA graph capture"):
+        group.build_metadata_for_cudagraph_capture(common)
