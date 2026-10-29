@@ -670,6 +670,29 @@ class VllmConfig:
         speculative_config = self.speculative_config
         if speculative_config is None or not speculative_config.use_eagle():
             return 0
+        registered = get_speculative_method(speculative_config.method)
+        if registered is not None:
+            prefix_cache_lookahead = registered.prefix_cache_lookahead_tokens
+            if prefix_cache_lookahead is not None:
+                value = prefix_cache_lookahead(speculative_config)
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 0
+                ):
+                    raise ValueError(
+                        "Registered speculative method "
+                        f"'{speculative_config.method}' returned invalid "
+                        f"prefix_cache_lookahead_tokens={value!r}; expected "
+                        "a non-negative integer."
+                    )
+                return value
+            if self.cache_config.enable_prefix_caching:
+                raise ValueError(
+                    f"Registered speculative method '{speculative_config.method}' "
+                    "uses target hidden states and must declare "
+                    "`prefix_cache_lookahead_tokens` when prefix caching is enabled."
+                )
         if speculative_config.use_multi_module_mtp():
             # Each MTP module reads one token further ahead than the one before
             # it, so the chain needs num_speculative_tokens of runway at a

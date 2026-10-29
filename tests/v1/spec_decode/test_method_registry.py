@@ -5,8 +5,11 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
-from vllm.config import SpeculativeConfig, VllmConfig
+from vllm.config import CacheConfig, ModelConfig, SpeculativeConfig, VllmConfig
+from vllm.v1.core.kv_cache_planning import get_global_kv_cache_groups
+from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.spec_decode import registry
 from vllm.v1.spec_decode.registry import (
     SpeculativeMethodSpec,
@@ -128,6 +131,88 @@ def test_num_lookahead_tokens(registered):
     )
     config = SpeculativeConfig(method=NAME, num_speculative_tokens=5)
     assert _lookahead(config) == 8
+
+
+def _prefix_cache_vllm_config(speculative_config: SpeculativeConfig) -> VllmConfig:
+    return VllmConfig(
+        model_config=ModelConfig(max_model_len=64),
+        cache_config=CacheConfig(enable_prefix_caching=True),
+        speculative_config=speculative_config,
+    )
+
+
+def test_registered_method_requires_prefix_cache_lookahead_declaration(registered):
+    registered()
+    vllm_config = _prefix_cache_vllm_config(
+        SpeculativeConfig(method=NAME, num_speculative_tokens=2)
+    )
+
+    with pytest.raises(ValueError, match="prefix_cache_lookahead_tokens"):
+        _ = vllm_config.num_prefill_lookahead_tokens
+
+
+def test_registered_prefix_cache_lookahead_flows_to_hashing(registered):
+    registered(
+        SpeculativeMethodSpec(SPEC_CLS, prefix_cache_lookahead_tokens=lambda _: 2)
+    )
+    vllm_config = _prefix_cache_vllm_config(
+        SpeculativeConfig(method=NAME, num_speculative_tokens=2)
+    )
+
+    assert vllm_config.num_prefill_lookahead_tokens == 2
+    assert vllm_config.num_hash_lookahead_tokens == 2
+
+
+@pytest.mark.parametrize("value", [-1, True, 1.5, "one"])
+def test_registered_prefix_cache_lookahead_rejects_invalid_declarations(
+    registered, value
+):
+    registered(
+        SpeculativeMethodSpec(
+            SPEC_CLS, prefix_cache_lookahead_tokens=lambda _: value
+        )
+    )
+    vllm_config = _prefix_cache_vllm_config(
+        SpeculativeConfig(method=NAME, num_speculative_tokens=2)
+    )
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        _ = vllm_config.num_prefill_lookahead_tokens
+
+
+@pytest.mark.parametrize("annotate_draft", [False, True])
+def test_registered_prefix_cache_lookahead_requires_draft_kv_annotation(
+    registered, annotate_draft
+):
+    registered(
+        SpeculativeMethodSpec(SPEC_CLS, prefix_cache_lookahead_tokens=lambda _: 1)
+    )
+    vllm_config = _prefix_cache_vllm_config(
+        SpeculativeConfig(method=NAME, num_speculative_tokens=2)
+    )
+    specs = {
+        "target": FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+        ),
+        "draft": FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+            is_draft=annotate_draft,
+        ),
+    }
+
+    if not annotate_draft:
+        with pytest.raises(ValueError, match="no draft KV cache spec"):
+            get_global_kv_cache_groups(vllm_config, [specs])
+        return
+
+    groups = get_global_kv_cache_groups(vllm_config, [specs])
+    assert any(group.is_eagle_group for group in groups)
 
 
 def test_hash_depends_on_method_config_and_aux_trait(registered):
